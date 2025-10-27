@@ -1,4 +1,4 @@
-FROM ubuntu:16.04
+FROM ubuntu:22.04
 MAINTAINER kunst1080 kontrapunkt1080@gmail.com
 
 RUN apt update -y \
@@ -17,6 +17,9 @@ RUN apt update -y \
         gcc \
         g++ \
         make \
+        wget \
+        ca-certificates \
+        python3 \
 	&& rm -rf /var/lib/apt/lists/*
 
 ARG uid
