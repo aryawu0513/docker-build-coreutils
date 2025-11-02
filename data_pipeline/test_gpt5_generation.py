@@ -1,22 +1,93 @@
 import dspy
 import os
+from tree_sitter import Language, Parser
+import tree_sitter_c as tsc
 
-class ShellToUnityTests(dspy.Signature):
+
+def get_function_info(c_file, parser):
     """
-    You will be given a coreutils program and its shell tests.
-    Your task is to convert these shell tests into a test suite that tests the coreutils program, using the Unity Testing Framework.
+    Extract detailed information about all functions (except main).
+    
+    Args:
+        c_file: C source file path
+        parser: tree-sitter Parser instance
+    
+    Returns:
+        List of dicts with keys: 'name', 'start_byte', 'end_byte', 'code', 'signature'
+    """
+    # Parse the code
+    with open(c_file, 'rb') as f:
+        c_code = f.read()
+    tree = parser.parse(c_code)
+    
+    functions = []
+    
+    def get_function_signature(func_def_node):
+        """Extract the function signature (return type + declarator)"""
+        signature_parts = []
+        
+        for child in func_def_node.children:
+            # Get everything before the compound_statement (function body)
+            if child.type == 'compound_statement':
+                break
+            signature_parts.append(c_code[child.start_byte:child.end_byte])
+        
+        return b' '.join(signature_parts).decode('utf-8').strip()
+    
+    def traverse_tree(node):
+        """Recursively traverse to find function definitions"""
+        if node.type == 'function_definition':
+            # Extract function name
+            func_name = None
+            for child in node.children:
+                if child.type == 'function_declarator':
+                    for subchild in child.children:
+                        if subchild.type == 'identifier':
+                            func_name = c_code[subchild.start_byte:subchild.end_byte].decode('utf-8')
+                            break
+                    break
+            
+            # Skip main function
+            if func_name and func_name != 'main':
+                func_code = c_code[node.start_byte:node.end_byte].decode('utf-8')
+                signature = get_function_signature(node)
+                
+                functions.append({
+                    'name': func_name,
+                    'start_byte': node.start_byte,
+                    'end_byte': node.end_byte,
+                    'code': func_code,
+                    'signature': signature
+                })
+        
+        # Recursively traverse children
+        for child in node.children:
+            traverse_tree(child)
+    
+    traverse_tree(tree.root_node)
+    return functions
 
-    The coreutils program have its main() function removed, and your tests.c will be #include'd directly into the program at the end.
-    This means ALL functions in the program are directly accessible - you do NOT need extern declarations and do NOT need to include prototypes for functions defined in `program.c`.
+class FunctionToUnityTests(dspy.Signature):
+    """
+    You will be given a coreutils program and the name of a SPECIFIC FUNCTION within it to test.
+    You should read the coreutils program code and find the code of the target function, and understand its purpose.
+    Your task is to write a test suite (tests.c) that thoroughly tests ONLY this specific function, using the Unity Testing Framework.
+
+    IMPORTANT: Your test suite will be evaluated using MUTATION TESTING on ONLY this target function.
+    This means:
+    - We will inject bugs/mutations into ONLY the target function
+    - Your tests must be thorough enough to catch these mutations
+    - Focus on edge cases, boundary conditions, and error paths
+    - Test different input combinations that exercise all code paths in the function
     
-    Since main() is removed, you may need to simulate main logic in your tests:
-    - Set up argc/argv as needed
-    - Call parsing functions
-    - Call processing functions with appropriate arguments
-    - Verify the results
-    
-    REQUIRED FORMAT for `tests.c`:
-    - A Unity test file that thoroughly tests the coreutils program's functionality.
+    CONTEXT:
+    - The original main() function has been removed from the coreutils program source.
+    - Your tests.c file will be directly included into the program source (e.g., via #include "../tests/<program>_tests.c").
+    - All internal functions from the program are accessible — no need for extern declarations.
+    - Do not redefine or redeclare any global symbols (functions or variables) that already exist in the program or its headers.
+    - Use the same headers as the original source file. Do not redefine, #undef, or override any macros, constants, or inline helpers from production headers.
+
+    REQUIRED FORMAT for `tests.c`: A Unity test file that thoroughly tests the given function's functionality.
     - At the top of the file, add 
         ```c
         #include "../../unity/unity.h"
@@ -31,20 +102,20 @@ class ShellToUnityTests(dspy.Signature):
         /* Cleanup code here, or leave empty */
         }
         ```
-    - Create test functions: void test_xxx(void) { ... } that exercise the coreutils program's functionality.
-    - The test file must define a main() function that calls UNITY_BEGIN(), runs tests with RUN_TEST(test_xxx), and returns UNITY_END().
+    - Create multiple test functions: void test_<function_name>_xxx(void) { ... }. Each test function should set up the necessary preconditions, call the target function, and use Unity assertions to verify expected outcomes.
+    - Define main() that calls UNITY_BEGIN(), RUN_TEST() for each test, and returns UNITY_END().
+    - CRITICAL RULES FOR STDOUT/STDERR REDIRECTION: Unity's TEST_ASSERT macros write to stdout. If your test redirects stdout (common for I/O testing), Do NOT use TEST_ASSERT macros while stdout is redirected. Use simple if-checks with return NULL for errors. Only use TEST_ASSERT before redirection or after restoration.
     """
 
-    program_code: str = dspy.InputField(description="The coreutils program (e.g., 'cat.c', 'ls.c')")
-    shell_tests: str = dspy.InputField(description="Content of all shell test files with their filenames, separated by --- markers")
-    tests_c: str = dspy.OutputField(description="Complete Unity test file tests.c that tests the program's behavior")
+    program_code: str = dspy.InputField(description="The full coreutils program code")
+    target_function_name: str = dspy.InputField(description="Name of the specific function to test")
+    tests_c: str = dspy.OutputField(description="Complete Unity test file that thoroughly tests ONLY the target function")
 
-def generate_unity_tests_with_llm(program_name, program_code, shell_tests):
+def generate_unity_tests_with_llm(program_code, target_function_name):
     """
     Args:
         program_code: The coreutils program code (e.g., "cat.c")
-        shell_tests: List of dicts with 'filename' and 'content'
-    
+        target_function_name: Name of the specific function to test
     Returns:
         String containing the generated C code, or False on failure
     """
@@ -59,19 +130,13 @@ def generate_unity_tests_with_llm(program_name, program_code, shell_tests):
 
         print("model loaded")
         
-        # Format shell tests for the prompt
-        tests_text = "\n\n---\n\n".join([
-            f"File: {t['filename']}\n{t['content']}" 
-            for t in shell_tests
-        ])
-        
         # Use ChainOfThought for better reasoning
-        converter = dspy.ChainOfThought(ShellToUnityTests)
+        converter = dspy.ChainOfThought(FunctionToUnityTests)
         
         # Generate the Unity tests
         result = converter(
             program_code=program_code,
-            shell_tests=tests_text
+            target_function_name=target_function_name
         )
 
         print("LLM generation completed:", result)
@@ -81,7 +146,7 @@ def generate_unity_tests_with_llm(program_name, program_code, shell_tests):
         
         # Check if generation failed (empty string)
         if not tests_c:
-            print(f"  ✗ LLM returned empty tests for {program_name}")
+            print(f"  ✗ LLM returned empty tests for {target_function_name}")
             return False
         
         # Remove markdown code blocks if present
@@ -98,67 +163,24 @@ def generate_unity_tests_with_llm(program_name, program_code, shell_tests):
 
 # Example usage
 if __name__ == "__main__":
-    print("Generating Unity tests for 'cat'...")
-    #read in cat code from cat.c
-    cat_code = open("cat.c").read()
-    # Example shell tests
-    shell_tests = [
-        {
-            'filename': 'cat-self.sh',
-            'content': """. "${srcdir=.}/tests/init.sh"; path_prepend_ ./src
-print_ver_ cat
-
-echo x >out || framework_failure_
-echo x >out1 || framework_failure_
-returns_ 1 cat out >>out || fail=1
-compare out out1 || fail=1
-
-# This example is taken from the POSIX spec for 'cat'.
-echo x >doc || framework_failure_
-echo y >doc.end || framework_failure_
-cat doc doc.end >doc || fail=1
-compare doc doc.end || fail=1
-
-# This terminates even though it copies a file to itself.
-# Coreutils 9.5 and earlier rejected this.
-echo x >fx || framework_failure_
-echo y >fy || framework_failure_
-cat fx fy >fxy || fail=1
-for i in 1 2; do
-  cat fx >fxy$i || fail=1
-done
-for i in 3 4 5 6; do
-  cat fx >fx$i || fail=1
-done
-cat - fy <fxy1 1<>fxy1 || fail=1
-compare fxy fxy1 || fail=1
-cat fxy2 fy 1<>fxy2 || fail=1
-compare fxy fxy2 || fail=1
-returns_ 1 cat fx fx3 1<>fx3 || fail=1
-returns_ 1 cat - fx4 <fx 1<>fx4 || fail=1
-returns_ 1 cat fx5 >>fx5 || fail=1
-returns_ 1 cat <fx6 >>fx6 || fail=1
-
-# coreutils 9.6 would fail with a plain cat if the tty was in append mode
-# Simulate with a regular file to simplify
-echo foo > file || framework_failure_
-# Set fd 3 at EOF
-exec 3< file && cat <&3 > /dev/null || framework_failure_
-# Set fd 4 in append mode
-exec 4>> file || framework_failure_
-cat <&3 >&4 || fail=1
-exec 3<&- 4>&-
-
-Exit $fail
-            """
-        }
-    ]
-    
-    # Generate Unity tests
-    result = generate_unity_tests_with_llm("cat",cat_code, shell_tests)
-
-    if result:
-        print("Generated tests:")
-        print(result)
-    else:
-        print("Failed to generate tests")
+    C_LANGUAGE = Language(tsc.language())
+    parser = Parser(C_LANGUAGE)
+    print("Generating Unity tests for 'cksum'...")
+    file_name = "cksum.c"
+    with open(file_name, 'r') as f:
+        code_without_main = f.read()
+    function_info = get_function_info(file_name, parser)
+    for func in function_info:
+        function_name = func['name']
+        function_signature = func['signature']
+        result = generate_unity_tests_with_llm(code_without_main, function_signature)
+        result_tests_c_name = f"cksum/tests_for_{function_name.replace(' ','_').replace('(','_').replace(')','')}.c"
+        #note, this will need to be included in the program to be compiled and run
+        if result:
+            os.makedirs(os.path.dirname(result_tests_c_name), exist_ok=True)
+            print(f"Writing generated tests to {result_tests_c_name}...")
+            with open(result_tests_c_name, "w") as f:
+                f.write(result)
+        else:
+            print("Failed to generate tests for function:", function_name)
+    print("Done.")

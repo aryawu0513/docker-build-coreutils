@@ -43,12 +43,69 @@ def read_shell_tests(program_name):
             })
     return tests_content
 
-def remove_main_with_treesitter(c_file):
-    """Use tree-sitter to remove main() function from C file"""
-    # Load C parser
-    C_LANGUAGE = Language(tsc.language())
-    parser = Parser(C_LANGUAGE)
+def get_function_info(c_code, parser):
+    """
+    Extract detailed information about all functions (except main).
     
+    Args:
+        c_code: C source code as bytes
+        parser: tree-sitter Parser instance
+    
+    Returns:
+        List of dicts with keys: 'name', 'start_byte', 'end_byte', 'code', 'signature'
+    """
+    # Parse the code
+    tree = parser.parse(c_code)
+    
+    functions = []
+    
+    def get_function_signature(func_def_node):
+        """Extract the function signature (return type + declarator)"""
+        signature_parts = []
+        
+        for child in func_def_node.children:
+            # Get everything before the compound_statement (function body)
+            if child.type == 'compound_statement':
+                break
+            signature_parts.append(c_code[child.start_byte:child.end_byte])
+        
+        return b' '.join(signature_parts).decode('utf-8').strip()
+    
+    def traverse_tree(node):
+        """Recursively traverse to find function definitions"""
+        if node.type == 'function_definition':
+            # Extract function name
+            func_name = None
+            for child in node.children:
+                if child.type == 'function_declarator':
+                    for subchild in child.children:
+                        if subchild.type == 'identifier':
+                            func_name = c_code[subchild.start_byte:subchild.end_byte].decode('utf-8')
+                            break
+                    break
+            
+            # Skip main function
+            if func_name and func_name != 'main':
+                func_code = c_code[node.start_byte:node.end_byte].decode('utf-8')
+                signature = get_function_signature(node)
+                
+                functions.append({
+                    'name': func_name,
+                    'start_byte': node.start_byte,
+                    'end_byte': node.end_byte,
+                    'code': func_code,
+                    'signature': signature
+                })
+        
+        # Recursively traverse children
+        for child in node.children:
+            traverse_tree(child)
+    
+    traverse_tree(tree.root_node)
+    return functions
+
+def remove_main_with_treesitter(c_file,parser):
+    """Use tree-sitter to remove main() function from C file"""
     # Read the file
     with open(c_file, 'rb') as f:
         source_code = f.read()
@@ -87,10 +144,10 @@ def remove_main_with_treesitter(c_file):
             f.write(new_source)
         
         print(f"  ✓ Removed main() from {c_file}")
-        return True
+        return new_source
     else:
         print(f"  ⚠ No main() found in {c_file}")
-        return False
+        return source_code
 
 
 def add_test_include(c_file, program_name):
@@ -220,15 +277,26 @@ def run_tests(program_name):
 
 
 if __name__ == "__main__":
-    example_file = "/home/aryawu/docker-build-coreutils/data_pipeline/cksum.c"
-    #1. Extract program name
-    program_name = extract_program_name(example_file)
-    #2. Find shell tests
-    shell_tests_contents = read_shell_tests(program_name)
-    #3. Generate Unity tests with LLM
+    # Load C parser
+    C_LANGUAGE = Language(tsc.language())
+    parser = Parser(C_LANGUAGE)
+    example_file = "/home/aryawu/docker-build-coreutils/data_pipeline/cat.c"
+    #1. Use tree-sitter to remove main()
+    code_without_main = remove_main_with_treesitter(example_file,parser)
+    #2. Get all the functions
+    function_info = get_function_info(code_without_main, parser)
+    for func in function_info:
+        print(f"  - {func['name']}: {func['signature']}")
+        # generate_function_specific_tests_with_llm(
+
+    # #3. Extract program name
+    # program_name = extract_program_name(example_file)
+
+    # #4. Find shell tests
+    # shell_tests_contents = read_shell_tests(program_name)
+    #5. Generate Unity tests with LLM
     generate_tests_success = generate_unity_tests_with_llm(program_name, shell_tests_contents)
-    #4. use tree-sitter to remove main()
-    remove_main_with_treesitter(example_file)
+
     #5. Add test include after config.h
     add_test_include(example_file, program_name)
     # We will do the build and execute tests in container for all together later.

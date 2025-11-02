@@ -21,7 +21,8 @@
 
    By tege@sics.se, Torbjörn Granlund, advised by rms, Richard Stallman.  */
 
-# include <config.h>
+#include <config.h>
+
 #include <stdio.h>
 #include <getopt.h>
 #include <sys/types.h>
@@ -528,7 +529,3 @@ copy_cat (void)
         return -1;
       }
 }
-
-
-
-#include "../tests/cat/cat_tests.c"
