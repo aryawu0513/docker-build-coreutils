@@ -48,3 +48,66 @@ Inside the container:
 ./src/cat README
 ./src/echo "Hello from my custom coreutils!”
 ```
+
+# 7. Make Unity testing work:
+mkdir unity in coreutils. copy over unity.h and unity.c
+In /src/local.mk, add unity/unity.o to the line:
+```bash
+LDADD = src/libver.a lib/libcoreutils.a unity/unity.o $(LIBINTL) $(MBRTOWC_LIB) \
+  $(INTL_MACOSX_LIBS) lib/libcoreutils.a
+```
+This will break other programs.
+
+To fix it: modify unity.c
+```c
+// Weak symbols for setUp/tearDown - programs without tests can link safely
+__attribute__((weak)) void setUp(void) {}
+__attribute__((weak)) void tearDown(void) {}
+```
+and rebuild it
+```bash
+gcc -c -o unity/unity.o unity/unity.c -I. -I./lib
+```
+
+Then regenerate Makefile
+```bash
+FORCE_UNSAFE_CONFIGURE=1 ./configure
+```
+and run make
+```bash
+make
+```
+
+# 8. Generating tests.c:
+Take the example of cat.c:
+- in cat.c: 
+```
+remove main() function. 
+add #include "../tests/cat/cat_tests.c"  // Go up 1 level, then into tests/cat/
+```
+- create the file cat_tests.c in tests/cat, using the .sh test files already in the folder as inspiration
+```
+The tests.c file should start with #include "../../unity/unity.h"
+It should have the Unity required setUp and tearDown functions
+It should have the main function:
+int main(void) {
+    UNITY_BEGIN();
+    RUN_TEST(..);
+    ...
+    return UNITY_END();
+}
+```
+
+Now, rerun make. Then running cat will show test results.
+```bash
+make src/cat
+./src/cat
+```
+
+
+Problems: it needs multiple tries before it can get a valid one.
+eg.
+/* 
+ * Since chcon.c will have main() removed, we need to test it differently.
+ * We'll create a wrapper that simulates calling main with argc/argv
+ */
