@@ -111,3 +111,13 @@ eg.
  * Since chcon.c will have main() removed, we need to test it differently.
  * We'll create a wrapper that simulates calling main with argc/argv
  */
+
+
+# Mull mutation testing:
+export FORCE_UNSAFE_CONFIGURE=1
+export CFLAGS="-fpass-plugin=/usr/lib/mull-ir-frontend-14 -g -grecord-command-line -fprofile-instr-generate -fcoverage-mapping"
+CC=clang-14 C_INCLUDE_PATH="/coreutils/lib:/coreutils/unity" ./configure
+
+make src/cat
+mull-runner-14 src/cat --debug >> mull.out 2>&1 
+

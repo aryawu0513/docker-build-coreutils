@@ -37,6 +37,8 @@ RUN apt update -y \
 RUN wget https://github.com/mull-project/mull/releases/download/0.26.1/Mull-14-0.26.1-LLVM-14.0-ubuntu-x86_64-22.04.deb -O /tmp/mull.deb && \
     apt-get install -y /tmp/mull.deb && rm /tmp/mull.deb
 
+ENV MULL_FLAGS="-fexperimental-new-pass-manager -fpass-plugin=/usr/lib/mull-ir-frontend-14 -grecord-command-line -g -v"
+
 # Create non-root user
 ARG uid
 RUN useradd user -u ${uid:-1000}
