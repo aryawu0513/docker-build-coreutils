@@ -2,6 +2,14 @@ import dspy
 import os
 from tree_sitter import Language, Parser
 import tree_sitter_c as tsc
+import re
+from pathlib import Path
+import json
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HOST_COREUTILS_PATH = os.path.join(SCRIPT_DIR, '..', 'coreutils')
+HOST_COREUTILS_PATH = os.path.abspath(HOST_COREUTILS_PATH)
+INJECTABLE_FUNCTION_PATH = os.path.join(HOST_COREUTILS_PATH, 'injectable_functions')
 
 
 def get_function_info(c_file, parser):
@@ -9,7 +17,7 @@ def get_function_info(c_file, parser):
     Extract detailed information about all functions (except main).
     
     Args:
-        c_file: C source file path
+        c_file: Path to the C source file
         parser: tree-sitter Parser instance
     
     Returns:
@@ -34,6 +42,12 @@ def get_function_info(c_file, parser):
         
         return b' '.join(signature_parts).decode('utf-8').strip()
     
+    def filter_trivial_function(func_code, min_lines):
+        """Return True if function has fewer than min_lines of code"""
+        # Count non-empty lines
+        lines = [line for line in func_code.splitlines() if line.strip()]
+        return len(lines) < min_lines
+        
     def traverse_tree(node):
         """Recursively traverse to find function definitions"""
         if node.type == 'function_definition':
@@ -50,6 +64,11 @@ def get_function_info(c_file, parser):
             # Skip main function
             if func_name and func_name != 'main':
                 func_code = c_code[node.start_byte:node.end_byte].decode('utf-8')
+                
+                # Skip functions that are too small
+                if filter_trivial_function(func_code, 10):
+                    return
+                
                 signature = get_function_signature(node)
                 
                 functions.append({
@@ -69,23 +88,14 @@ def get_function_info(c_file, parser):
 
 class FunctionToUnityTests(dspy.Signature):
     """
-    You will be given a coreutils program and the name of a SPECIFIC FUNCTION within it to test.
-    You should read the coreutils program code and find the code of the target function, and understand its purpose.
-    Your task is to write a test suite (tests.c) that thoroughly tests ONLY this specific function, using the Unity Testing Framework.
+    You will be given a coreutils program and the name of a SPECIFIC FUNCTION within it.
+    Your task is to write a standalone test suite (tests_for_{function_name}.c) that thoroughly tests ONLY this specific function, using the Unity Testing Framework.
 
-    IMPORTANT: Your test suite will be evaluated using MUTATION TESTING on ONLY this target function.
-    This means:
-    - We will inject bugs/mutations into ONLY the target function
-    - Your tests must be thorough enough to catch these mutations
-    - Focus on edge cases, boundary conditions, and error paths
-    - Test different input combinations that exercise all code paths in the function
-    
     CONTEXT:
     - The original main() function has been removed from the coreutils program source.
-    - Your tests.c file will be directly included into the program source (e.g., via #include "../tests/<program>_tests.c").
-    - All internal functions from the program are accessible — no need for extern declarations.
-    - Do not redefine or redeclare any global symbols (functions or variables) that already exist in the program or its headers.
-    - Use the same headers as the original source file. Do not redefine, #undef, or override any macros, constants, or inline helpers from production headers.
+    - Your tests_for_{function_name}.c file has been directly included into the program source (e.g., via #include "../tests/tests_for_{function_name}.c").
+    - All internal functions from the program are accessible.
+    - Ensure the test file does not break compilation: do not redefine or redeclare any global symbols, macros, constants, or inline helpers from the original program or its headers.
 
     REQUIRED FORMAT for `tests.c`: A Unity test file that thoroughly tests the given function's functionality.
     - At the top of the file, add 
@@ -106,12 +116,12 @@ class FunctionToUnityTests(dspy.Signature):
     - Define main() that calls UNITY_BEGIN(), RUN_TEST() for each test, and returns UNITY_END().
     - CRITICAL RULES FOR STDOUT/STDERR REDIRECTION: Unity's TEST_ASSERT macros write to stdout. If your test redirects stdout (common for I/O testing), Do NOT use TEST_ASSERT macros while stdout is redirected. Use simple if-checks with return NULL for errors. Only use TEST_ASSERT before redirection or after restoration.
     """
-
+    program_name : str = dspy.InputField(description="The coreutils program name (e.g., 'cat')")
     program_code: str = dspy.InputField(description="The full coreutils program code")
     target_function_name: str = dspy.InputField(description="Name of the specific function to test")
     tests_c: str = dspy.OutputField(description="Complete Unity test file that thoroughly tests ONLY the target function")
 
-def generate_unity_tests_with_llm(program_code, target_function_name):
+def generate_unity_tests_with_llm(program_name,program_code, target_function_name):
     """
     Args:
         program_code: The coreutils program code (e.g., "cat.c")
@@ -135,6 +145,7 @@ def generate_unity_tests_with_llm(program_code, target_function_name):
         
         # Generate the Unity tests
         result = converter(
+            program_name=program_name,
             program_code=program_code,
             target_function_name=target_function_name
         )
@@ -161,26 +172,113 @@ def generate_unity_tests_with_llm(program_code, target_function_name):
         print(f"  ✗ Error generating tests with LLM: {e}")
         return False
 
+
+
+def remove_main_with_treesitter(c_file,parser):
+    """Use tree-sitter to remove main() function from C file"""
+    # Read the file
+    with open(c_file, 'rb') as f:
+        source_code = f.read()
+    
+    # Parse the code
+    tree = parser.parse(source_code)
+    root_node = tree.root_node
+    
+    # Find main function
+    def find_main_function(node):
+        if node.type == 'function_definition':
+            # Check if this is the main function
+            for child in node.children:
+                if child.type == 'function_declarator':
+                    for subchild in child.children:
+                        if subchild.type == 'identifier' and source_code[subchild.start_byte:subchild.end_byte] == b'main':
+                            return node
+        
+        for child in node.children:
+            result = find_main_function(child)
+            if result:
+                return result
+        return None
+    
+    main_node = find_main_function(root_node)
+    
+    if main_node:
+        # Remove the main function
+        start_byte = main_node.start_byte
+        end_byte = main_node.end_byte
+        
+        new_source = source_code[:start_byte] + source_code[end_byte:]
+        
+        print(f"  ✓ Removed main() from {c_file}")
+        return new_source
+    else:
+        print(f"  ⚠ No main() found in {c_file}")
+        return source_code
+
+def append_include_line_to_code(code_without_main, include_line):
+    """Return new code string with include_line appended if absent."""
+    lines = code_without_main.splitlines()
+    if include_line in lines:
+        return '\n'.join(lines) + '\n'  # unchanged (but normalized newline)
+    lines.append(include_line)
+    return '\n'.join(lines) + '\n'
+
+def extract_program_name(c_file):
+    """Extract program name from .c file (e.g., cat.c -> cat)"""
+    return Path(c_file).stem
+
+
 # Example usage
 if __name__ == "__main__":
     C_LANGUAGE = Language(tsc.language())
     parser = Parser(C_LANGUAGE)
-    print("Generating Unity tests for 'cksum'...")
-    file_name = "cksum.c"
-    with open(file_name, 'r') as f:
-        code_without_main = f.read()
-    function_info = get_function_info(file_name, parser)
+    program_name = "date"
+    print(f"Generating Unity tests for {program_name}...")
+
+    src_c_path = os.path.join(HOST_COREUTILS_PATH, 'src', f"{program_name}.c")
+    tests_dir_path = os.path.join(HOST_COREUTILS_PATH, 'tests', program_name)
+    # Check that the source file exists
+    if not os.path.exists(src_c_path):
+        raise FileNotFoundError(f"Required source file does not exist: {src_c_path}")
+
+    # Check that the tests directory exists
+    if not os.path.exists(tests_dir_path):
+        raise FileNotFoundError(f"Required tests directory does not exist: {tests_dir_path}")
+    injectable_json_path = os.path.join(INJECTABLE_FUNCTION_PATH, f"{program_name}_injectable_functions.json")
+
+    with open(src_c_path, 'r') as f:
+        original_code = f.read()
+
+    code_without_main = remove_main_with_treesitter(src_c_path, parser).decode('utf-8')
+    function_info = get_function_info(src_c_path, parser)
+
+    injectable_functions = []
+
     for func in function_info:
         function_name = func['name']
+        function_name_clean = re.sub(r'[^0-9a-zA-Z_]', '_', function_name)
         function_signature = func['signature']
-        result = generate_unity_tests_with_llm(code_without_main, function_signature)
-        result_tests_c_name = f"cksum/tests_for_{function_name.replace(' ','_').replace('(','_').replace(')','')}.c"
-        #note, this will need to be included in the program to be compiled and run
-        if result:
-            os.makedirs(os.path.dirname(result_tests_c_name), exist_ok=True)
-            print(f"Writing generated tests to {result_tests_c_name}...")
-            with open(result_tests_c_name, "w") as f:
-                f.write(result)
+        include_line = f'#include "../tests/{program_name}/tests_for_{function_name_clean}.c"'
+
+        injectable_functions.append({
+            "function_name": function_name,
+            "function_signature": function_signature,
+            "include_line": include_line
+        })
+
+        code_with_test_include = append_include_line_to_code(code_without_main, include_line)
+        tests_c_result = generate_unity_tests_with_llm(program_name, code_with_test_include, function_signature)
+
+        #write test file for this function
+        tests_c_per_function_path= os.path.join(tests_dir_path,f"tests_for_{function_name_clean}.c")
+        if tests_c_result:
+            print(f"Writing generated tests to {tests_c_per_function_path}...")
+            with open(tests_c_per_function_path, "w") as f:
+                f.write(tests_c_result)
         else:
             print("Failed to generate tests for function:", function_name)
+
+    with open(injectable_json_path, "w") as f:
+        json.dump(injectable_functions, f, indent=2)
+
     print("Done.")

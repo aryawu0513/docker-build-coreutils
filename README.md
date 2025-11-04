@@ -114,6 +114,7 @@ eg.
 
 
 # Mull mutation testing:
+make clean
 export FORCE_UNSAFE_CONFIGURE=1
 export CFLAGS="-fpass-plugin=/usr/lib/mull-ir-frontend-14 -g -grecord-command-line -fprofile-instr-generate -fcoverage-mapping"
 CC=clang-14 C_INCLUDE_PATH="/coreutils/lib:/coreutils/unity" ./configure
@@ -121,3 +122,23 @@ CC=clang-14 C_INCLUDE_PATH="/coreutils/lib:/coreutils/unity" ./configure
 make src/cat
 mull-runner-14 src/cat --debug >> mull.out 2>&1 
 
+You will need at the top level of coreutils, a mull.yml that contains
+```yml
+mutators:
+  - cxx_all
+
+timeout: 10000
+
+includePaths:
+  - '/coreutils/src/cat.c$'
+```
+
+
+
+# FULL PIPELINE:
+1. generate the unit tests:
+```python test_gpt5_generation.py```
+2. build and execute the unit tests:
+```python test_container_one.py```
+3. mull mutation testing on the unit tests:
+Problem: Tests that passes in ./src/cat does not pass when doing mull-runner-14, why?
