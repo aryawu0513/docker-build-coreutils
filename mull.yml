@@ -1,0 +1,7 @@
+mutators:
+  - cxx_all
+
+timeout: 10000
+
+includePaths:
+  - '/coreutils/src/.*\.c$'

@@ -121,27 +121,37 @@ class FunctionToUnityTests(dspy.Signature):
     target_function_name: str = dspy.InputField(description="Name of the specific function to test")
     tests_c: str = dspy.OutputField(description="Complete Unity test file that thoroughly tests ONLY the target function")
 
-def generate_unity_tests_with_llm(program_name,program_code, target_function_name):
+def initialize_llm():
     """
+    Initialize the LLM once and return the configured converter.
+    This should be called once at the start of the program.
+    """
+    print("Initializing LLM...")
+    lm = dspy.LM(
+        "gpt-5",
+        model_type="chat",
+        temperature=1.0,
+        max_tokens=16000,  # these are required by gpt5
+    )
+    dspy.configure(lm=lm)
+    converter = dspy.ChainOfThought(FunctionToUnityTests)
+    print("  ✓ LLM initialized successfully")
+    return converter
+
+def generate_unity_tests_with_llm(converter, program_name, program_code, target_function_name):
+    """
+    Generate Unity tests using a pre-initialized LLM converter.
+    
     Args:
+        converter: Pre-initialized dspy.ChainOfThought(FunctionToUnityTests) instance
+        program_name: The coreutils program name
         program_code: The coreutils program code (e.g., "cat.c")
         target_function_name: Name of the specific function to test
     Returns:
         String containing the generated C code, or False on failure
     """
     try:
-        lm = dspy.LM(
-            "gpt-5",
-            model_type="chat",
-            temperature=1.0,
-            max_tokens=16000,#these are required by gpt5
-        )
-        dspy.configure(lm=lm)
-
-        print("model loaded")
-        
-        # Use ChainOfThought for better reasoning
-        converter = dspy.ChainOfThought(FunctionToUnityTests)
+        print(f"  Generating tests for {target_function_name}...")
         
         # Generate the Unity tests
         result = converter(
@@ -150,7 +160,7 @@ def generate_unity_tests_with_llm(program_name,program_code, target_function_nam
             target_function_name=target_function_name
         )
 
-        print("LLM generation completed:", result)
+        print(f"  ✓ LLM generation completed for {target_function_name}")
         
         # Extract the generated tests.c code
         tests_c = result.tests_c.strip()
@@ -169,12 +179,12 @@ def generate_unity_tests_with_llm(program_name,program_code, target_function_nam
         return tests_c.strip()
         
     except Exception as e:
-        print(f"  ✗ Error generating tests with LLM: {e}")
+        print(f"  ✗ Error generating tests with LLM for {target_function_name}: {e}")
         return False
 
 
 
-def remove_main_with_treesitter(c_file,parser):
+def remove_main_with_treesitter(c_file, parser):
     """Use tree-sitter to remove main() function from C file"""
     # Read the file
     with open(c_file, 'rb') as f:
@@ -228,22 +238,23 @@ def extract_program_name(c_file):
     return Path(c_file).stem
 
 
-# Example usage
-if __name__ == "__main__":
+def generate_tests_for_one_coreutils_program(program_name):
     C_LANGUAGE = Language(tsc.language())
     parser = Parser(C_LANGUAGE)
-    program_name = "date"
     print(f"Generating Unity tests for {program_name}...")
 
     src_c_path = os.path.join(HOST_COREUTILS_PATH, 'src', f"{program_name}.c")
     tests_dir_path = os.path.join(HOST_COREUTILS_PATH, 'tests', program_name)
+    
     # Check that the source file exists
     if not os.path.exists(src_c_path):
         raise FileNotFoundError(f"Required source file does not exist: {src_c_path}")
 
     # Check that the tests directory exists
     if not os.path.exists(tests_dir_path):
-        raise FileNotFoundError(f"Required tests directory does not exist: {tests_dir_path}")
+        os.makedirs(tests_dir_path, exist_ok=True)
+        print(f"Required tests directory does not exist: {tests_dir_path}. Making the directory.")
+    
     injectable_json_path = os.path.join(INJECTABLE_FUNCTION_PATH, f"{program_name}_injectable_functions.json")
 
     with open(src_c_path, 'r') as f:
@@ -252,14 +263,26 @@ if __name__ == "__main__":
     code_without_main = remove_main_with_treesitter(src_c_path, parser).decode('utf-8')
     function_info = get_function_info(src_c_path, parser)
 
+    # Initialize LLM once for all functions
+    print("\n" + "="*60)
+    print("INITIALIZATION")
+    print("="*60)
+    converter = initialize_llm()
+
+    print("\n" + "="*60)
+    print(f"GENERATING TESTS FOR {len(function_info)} FUNCTIONS")
+    print("="*60)
+    
     injectable_functions = []
 
-    for func in function_info:
+    for i, func in enumerate(function_info, 1):
         function_name = func['name']
         function_name_clean = re.sub(r'[^0-9a-zA-Z_]', '_', function_name)
         function_signature = func['signature']
         include_line = f'#include "../tests/{program_name}/tests_for_{function_name_clean}.c"'
 
+        print(f"\n[{i}/{len(function_info)}] Processing function: {function_name}")
+        
         injectable_functions.append({
             "function_name": function_name,
             "function_signature": function_signature,
@@ -267,18 +290,34 @@ if __name__ == "__main__":
         })
 
         code_with_test_include = append_include_line_to_code(code_without_main, include_line)
-        tests_c_result = generate_unity_tests_with_llm(program_name, code_with_test_include, function_signature)
+        
+        # Reuse the same converter for all functions
+        tests_c_result = generate_unity_tests_with_llm(
+            converter,
+            program_name, 
+            code_with_test_include, 
+            function_signature
+        )
 
-        #write test file for this function
-        tests_c_per_function_path= os.path.join(tests_dir_path,f"tests_for_{function_name_clean}.c")
+        # Write test file for this function
+        tests_c_per_function_path = os.path.join(tests_dir_path, f"tests_for_{function_name_clean}.c")
         if tests_c_result:
-            print(f"Writing generated tests to {tests_c_per_function_path}...")
+            print(f"  ✓ Writing generated tests to {tests_c_per_function_path}")
             with open(tests_c_per_function_path, "w") as f:
                 f.write(tests_c_result)
         else:
-            print("Failed to generate tests for function:", function_name)
+            print(f"  ✗ Failed to generate tests for function: {function_name}")
 
+    # Save injectable functions metadata
+    print(f"\n  Writing injectable functions metadata to {injectable_json_path}")
     with open(injectable_json_path, "w") as f:
         json.dump(injectable_functions, f, indent=2)
 
-    print("Done.")
+    print("\n" + "="*60)
+    print("COMPLETE")
+    print("="*60)
+    print(f"Generated tests for {len(injectable_functions)} functions")
+
+if __name__ == "__main__":
+    program_name = "pwd"
+    generate_tests_for_one_coreutils_program(program_name)

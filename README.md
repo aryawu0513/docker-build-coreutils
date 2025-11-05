@@ -120,7 +120,7 @@ export CFLAGS="-fpass-plugin=/usr/lib/mull-ir-frontend-14 -g -grecord-command-li
 CC=clang-14 C_INCLUDE_PATH="/coreutils/lib:/coreutils/unity" ./configure
 
 make src/cat
-mull-runner-14 src/cat --debug >> mull.out 2>&1 
+mull-runner-14 src/ls --debug >> mull.out 2>&1 
 
 You will need at the top level of coreutils, a mull.yml that contains
 ```yml
@@ -134,11 +134,29 @@ includePaths:
 ```
 
 
+Problem with Tests that passes in ./src/cat does not pass when doing mull-runner-14: 
+
+mull-runner-14 src/date --allow-surviving --debug --no-test-output --ld-search-path "/lib/x86_64-linux-gnu"
+
+Adding fflush before fork() solves this.
+```
+fflush(stdout);
+fflush(stderr);
+
+pid_t pid = fork();
+```
+Its because if the parent has unflushed data in its stdout buffer, Child inherits the buffered "[DEBUG]..." text.
+fflush() empties the buffer before forking, so the child doesn't inherit the parent's buffered output and accidentally write it to the pipe later.
+
+Terminal (direct run): stdout is line-buffered, so each printf("...\n") flushes immediately. Buffer is usually empty by the time you fork.
+Under Mull/pipes: stdout is fully buffered (buffers ~4KB before auto-flushing). Your debug prints accumulate in the buffer, and fork() copies all that accumulated data to the child.
+
+
 
 # FULL PIPELINE:
+change program_name in both files.
 1. generate the unit tests:
 ```python test_gpt5_generation.py```
-2. build and execute the unit tests:
-```python test_container_one.py```
-3. mull mutation testing on the unit tests:
-Problem: Tests that passes in ./src/cat does not pass when doing mull-runner-14, why?
+2. build and execute the unit tests, optionally run mull mutation testing on the passed tests suites:
+```python test_container_one_mull.py```
+
