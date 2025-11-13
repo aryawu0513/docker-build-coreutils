@@ -149,6 +149,43 @@ def run_tests(program_name):
         print((r.stderr or "")[:1000])
     return passed, r.stdout, r.stderr
 
+import re
+
+def extract_mutation_metrics_from_output(output):
+    """Extract mutation score, killed, survived, total mutants from Mull output."""
+    # Special case 1: no mutants
+    if "No mutants found" in output:
+        return ("N/A", 0, 0, 0)
+
+    # Special case 2: all killed
+    if "All mutations have been killed" in output:
+        match = re.search(r"]\s*(\d+)/(\d+)\.\s*Finished", output)
+        total = int(match.group(2)) if match else 0
+        return (100, total, 0, total)
+
+    # Normal case: look for "Mutation score:"
+    score_match = re.search(r"Mutation score:\s*([0-9]+)%", output)
+    score = int(score_match.group(1)) if score_match else "N/A"
+
+    # Extract survived and total mutants
+    surv_match = re.search(r"Survived mutants \((\d+)/(\d+)\)", output)
+    if surv_match:
+        survived = int(surv_match.group(1))
+        total = int(surv_match.group(2))
+        killed = total - survived
+    else:
+        survived = killed = total = 0
+
+    return (score, killed, survived, total)
+
+
+def avg(values):
+    vals = [v for v in values if isinstance(v, (int, float))]
+    average = sum(vals) / len(vals) if vals else 0
+    print("values:",values, "vals:",vals, "sum(vals):", sum(vals), "len(vals):", len(vals), "average:", average)
+    return average
+
+
 def run_mull(program_name, function_name):
     """Run Mull mutation testing and save output to file."""
     reports_dir = "mull-reports"
@@ -165,7 +202,12 @@ def run_mull(program_name, function_name):
     r = run_in_container(mull_cmd, show_output=False, timeout=600)
     
     print(f"  Mull command return code: {r.returncode}")
-    
+    cat_result = run_in_container(f'cat {output_file}')
+    if cat_result.returncode == 0:
+        output_text = cat_result.stdout
+
+    score, killed, survived, total = extract_mutation_metrics_from_output(output_text)
+
     # Check if output file was created and has content
     check_cmd = f'[ -f {output_file} ] && wc -l {output_file}'
     check_result = run_in_container(check_cmd, show_output=False)
@@ -184,12 +226,12 @@ def run_mull(program_name, function_name):
                 print(f"  {line}")
             print("  " + "-"*50)
         
-        return True, output_file
+        return score,killed,survived,total, output_file
     else:
         print(f"  ✗ Mull execution may have failed")
         print(f"  Check output stdout: {r.stdout[:500] if r.stdout else '(empty)'}")
         print(f"  Check output stderr: {r.stderr[:500] if r.stderr else '(empty)'}")
-        return False, output_file
+        return score,killed,survived,total, output_file
 
 
 # ---------- file manipulation helpers ----------
@@ -293,38 +335,48 @@ def inject_and_test(program_name, HOST_COREUTILS_PATH, INJECTABLE_FUNCTION_PATH,
             print(f"  Wrote modified {src_c_path} (include: {include_line})")
 
             # build and run
-            built, build_out = build_program(program_name)
+            built, build_output = build_program(program_name)
+
+            result_entry = {
+                "function": function_name,
+                "build": built,
+                "test": False,
+                "mull_score": None,
+                "mull_total": 0,
+                "mull_killed": 0,
+                "mull_survived": 0,
+                "mull_output": None,
+                "stdout": "",
+                "stderr": "",
+                "build_output": build_output or ""
+            }
+
             if not built:
-                results.append({
-                    "function": function_name, 
-                    "build": False, 
-                    "test": False, 
-                    "mull": False,
-                    "build_output": build_out
-                })
-                # restore original before continuing
+                # restore original and continue
                 write_host_file(src_c_path, original_code)
                 print("  Restored code after failed build.")
+                results.append(result_entry)
                 continue
 
+
             passed, stdout, stderr = run_tests(program_name)
+            result_entry["test"] = passed
+            result_entry["stdout"] = stdout or ""
+            result_entry["stderr"] = stderr or ""
             
-            mull_success = False
-            mull_output_file = None
-            
+            # run Mull if enabled and tests passed
             if passed and run_mutation_testing:
                 print(f"  Function {function_name} passed tests. Running mutation testing...")
-                mull_success, mull_output_file = run_mull(program_name, function_name)
-            
-            results.append({
-                "function": function_name, 
-                "build": True, 
-                "test": passed, 
-                "mull": mull_success,
-                "mull_output": mull_output_file,
-                "stdout": stdout, 
-                "stderr": stderr
-            })
+                mull_score, mull_killed, mull_survived, mull_total, mull_output_file = run_mull(program_name, function_name)
+                result_entry.update({
+                    "mull_score": mull_score if mull_score != "N/A" else None,
+                    "mull_total": mull_total,
+                    "mull_killed": mull_killed,
+                    "mull_survived": mull_survived,
+                    "mull_output": mull_output_file
+                })
+
+            results.append(result_entry)
 
             if passed:
                 print(f"  ✓ Function {function_name} passed tests after injection.")
@@ -342,12 +394,8 @@ def inject_and_test(program_name, HOST_COREUTILS_PATH, INJECTABLE_FUNCTION_PATH,
     print("\n" + "="*40)
     print(f"Results for program {program_name}:")
     for r in results:
-        status = f"build={'✓' if r['build'] else '✗'}, test={'✓' if r['test'] else '✗'}"
-        if run_mutation_testing:
-            status += f", mull={'✓' if r.get('mull') else '✗'}"
+        status = f"build={'✓' if r['build'] else '✗'}, test={'✓' if r['test'] else '✗'}, mull_score={r['mull_score'] if r['mull_score'] is not None else 'N/A'}"
         print(f"  {r['function']}: {status}")
-        if r.get('mull_output'):
-            print(f"    Mull output: {r['mull_output']}")
     print("="*40)
     return results
 
@@ -388,7 +436,45 @@ def run_build_execute_mutate_for_one_coreutils_program(program_name, enable_muta
         print("\n" + "="*60)
         print("STEP 3: Inject tests and build")
         print("="*60)
-        inject_and_test(program_name, HOST_COREUTILS_PATH, INJECTABLE_FUNCTION_PATH, run_mutation_testing=enable_mutation_testing)
+        results = inject_and_test(program_name, HOST_COREUTILS_PATH, INJECTABLE_FUNCTION_PATH, run_mutation_testing=enable_mutation_testing)
+
+        file_path = "test_results_mull.txt"
+        header_needed = not os.path.exists(file_path)
+        with open(file_path, "a") as f:
+            if header_needed:
+                f.write("program_name,function_name,build,test,mull_score,mull_total,mull_killed,mull_survived\n")
+            for r in results:
+                f.write(
+                    f"{program_name},{r['function']},{r['build']},{r['test']},"
+                    f"{r['mull_score'] if r['mull_score'] is not None else 'N/A'},"
+                    f"{r['mull_total']},{r['mull_killed']},{r['mull_survived']}\n"
+                )
+
+        # # Count build and test successes/failures
+        # total = len(results)
+        # build_success = sum(1 for r in results if r['build'])
+        # build_fail = total - build_success
+        # test_success = sum(1 for r in results if r['test'])
+        # test_fail = total - test_success
+        # mull_score = avg(r['mull_score'] for r in results)
+        # mull_total = avg(r['mull_total'] for r in results)
+
+        # print("\n" + "="*40)
+        # print(f"SUMMARY for {program_name}:")
+        # print(f"  Total functions: {total}")
+        # print(f"  Build: {build_success} ✓ / {build_fail} ✗")
+        # print(f"  Test:  {test_success} ✓ / {test_fail} ✗")
+        # if enable_mutation_testing:
+        #     print(f"  Mull:  {mull_score} from {mull_total} ")
+        # print(f"  ")
+        # print("="*40)
+        # #write to txt tile the programname, Total,build_success, test_success
+        # file_path = "test_results_mull.txt"
+        # header_needed = not os.path.exists(file_path)
+        # with open(file_path, "a") as f:
+        #     if header_needed:
+        #         f.write("program_name,total,build_success,test_success,mull_score,mull_total\n")
+        #     f.write(f"{program_name},{total},{build_success},{test_success},{mull_score},{mull_total}\n")
 
     finally:
         stop_container()

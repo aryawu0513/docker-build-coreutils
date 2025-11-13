@@ -138,6 +138,17 @@ def initialize_llm():
     print("  ✓ LLM initialized successfully")
     return converter
 
+def fix_stdout_stderr(code):
+    """Add fflush calls before fork() to prevent duplicate output in child processes."""
+    if "pid_t pid = fork();" in code:
+        # Add fflush statements before the fork line
+        code = code.replace(
+            "pid_t pid = fork();",
+            "fflush(stdout);\n    fflush(stderr);\n    pid_t pid = fork();"
+        )
+    return code
+
+
 def generate_unity_tests_with_llm(converter, program_name, program_code, target_function_name):
     """
     Generate Unity tests using a pre-initialized LLM converter.
@@ -175,6 +186,9 @@ def generate_unity_tests_with_llm(converter, program_name, program_code, target_
             tests_c = tests_c.split("```c")[1].split("```")[0]
         elif "```" in tests_c:
             tests_c = tests_c.split("```")[1].split("```")[0]
+
+        # Fix stdout/stderr flushing before fork
+        tests_c = fix_stdout_stderr(tests_c)
         
         return tests_c.strip()
         
@@ -241,7 +255,7 @@ def extract_program_name(c_file):
 def generate_tests_for_one_coreutils_program(program_name):
     C_LANGUAGE = Language(tsc.language())
     parser = Parser(C_LANGUAGE)
-    print(f"Generating Unity tests for {program_name}...")
+    # print(f"Generating Unity tests for {program_name}...")
 
     src_c_path = os.path.join(HOST_COREUTILS_PATH, 'src', f"{program_name}.c")
     tests_dir_path = os.path.join(HOST_COREUTILS_PATH, 'tests', program_name)
@@ -264,14 +278,7 @@ def generate_tests_for_one_coreutils_program(program_name):
     function_info = get_function_info(src_c_path, parser)
 
     # Initialize LLM once for all functions
-    print("\n" + "="*60)
-    print("INITIALIZATION")
-    print("="*60)
     converter = initialize_llm()
-
-    print("\n" + "="*60)
-    print(f"GENERATING TESTS FOR {len(function_info)} FUNCTIONS")
-    print("="*60)
     
     injectable_functions = []
 
@@ -281,7 +288,7 @@ def generate_tests_for_one_coreutils_program(program_name):
         function_signature = func['signature']
         include_line = f'#include "../tests/{program_name}/tests_for_{function_name_clean}.c"'
 
-        print(f"\n[{i}/{len(function_info)}] Processing function: {function_name}")
+        # print(f"\n[{i}/{len(function_info)}] Processing function: {function_name}")
         
         injectable_functions.append({
             "function_name": function_name,
@@ -309,15 +316,15 @@ def generate_tests_for_one_coreutils_program(program_name):
             print(f"  ✗ Failed to generate tests for function: {function_name}")
 
     # Save injectable functions metadata
-    print(f"\n  Writing injectable functions metadata to {injectable_json_path}")
+    # print(f"\n  Writing injectable functions metadata to {injectable_json_path}")
     with open(injectable_json_path, "w") as f:
         json.dump(injectable_functions, f, indent=2)
 
-    print("\n" + "="*60)
-    print("COMPLETE")
-    print("="*60)
+    # print("\n" + "="*60)
+    # print("COMPLETE")
+    # print("="*60)
     print(f"Generated tests for {len(injectable_functions)} functions")
 
-if __name__ == "__main__":
-    program_name = "pwd"
-    generate_tests_for_one_coreutils_program(program_name)
+# if __name__ == "__main__":
+#     program_name = "pwd"
+#     generate_tests_for_one_coreutils_program(program_name)
